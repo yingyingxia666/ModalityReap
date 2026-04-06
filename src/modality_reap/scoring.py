@@ -80,6 +80,9 @@ def score_experts(observation_sets: dict[str, dict[int, dict[str, Any]]], use_ro
             text_weighted = text_state["weighted_frequency_norm"]
 
         generalist_score = torch.minimum(audio_freq, text_freq)
+        modal_gap_score = torch.abs(audio_freq - text_freq)
+        weighted_modal_gap_score = torch.abs(audio_weighted - text_weighted)
+        conflict_score = 0.5 * modal_gap_score + 0.5 * weighted_modal_gap_score
         audio_priority_score = 0.5 * audio_freq + 0.5 * audio_weighted + DEFAULT_GENERALIST_WEIGHT * generalist_score
         audio_priority_score = audio_priority_score - DEFAULT_TEXT_PENALTY_WEIGHT * text_weighted
 
@@ -103,6 +106,9 @@ def score_experts(observation_sets: dict[str, dict[int, dict[str, Any]]], use_ro
             "weighted_audio_score": audio_weighted,
             "weighted_text_score": text_weighted,
             "generalist_score": generalist_score,
+            "modal_gap_score": modal_gap_score,
+            "weighted_modal_gap_score": weighted_modal_gap_score,
+            "conflict_score": conflict_score,
             "audio_priority_score": audio_priority_score,
             "ranked_experts": ranked_experts,
         }

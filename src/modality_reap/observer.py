@@ -10,8 +10,8 @@ import torch.nn.functional as F
 import re
 from dataclasses import dataclass
 import logging
+
 import pathlib
-from functools import reduce
 
 from modality_reap.metrics import (
     ttm_online,

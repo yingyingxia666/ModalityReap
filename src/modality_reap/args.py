@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -47,16 +49,30 @@ class ObserverArgs:
 @dataclass
 class ClusterArgs:
     compression_ratio: float = field(default=0.5)
+    min_compression_ratio: float = field(default=0.3)
+    max_compression_ratio: float = field(default=0.7)
     num_clusters: Optional[int] = field(default=None)
     cluster_method: str = field(default="agglomerative")
     linkage_method: str = field(default="average")
     frequency_penalty: bool = field(default=True)
     softmax_temperature: Optional[float] = field(default=None)
     max_cluster_size: Optional[int] = field(default=None)
+    use_hybrid_strategy: bool = field(default=True)
+    use_layer_adaptive_schedule: bool = field(default=True)
     audio_protect_ratio: float = field(default=0.1)
     protect_middle_layers: bool = field(default=True)
     middle_layer_multiplier: float = field(default=1.5)
     use_router_analysis_prior: bool = field(default=True)
+    audio_keep_quantile: float = field(default=0.75)
+    shared_keep_quantile: float = field(default=0.8)
+    prune_audio_quantile: float = field(default=0.35)
+    prune_shared_quantile: float = field(default=0.35)
+    prune_conflict_quantile: float = field(default=0.5)
+    sensitivity_top1_weight: float = field(default=0.35)
+    sensitivity_cv_weight: float = field(default=0.3)
+    sensitivity_modal_gap_weight: float = field(default=0.25)
+    sensitivity_shared_hotspot_weight: float = field(default=0.1)
+    sensitivity_active_expert_weight: float = field(default=0.2)
 
 
 @dataclass
@@ -66,6 +82,9 @@ class MergeArgs:
     dom_as_base: bool = field(default=False)
     select_top_k: float = field(default=0.1)
     conservative_anchor_weight: float = field(default=0.9)
+    subspace_rank_ratio: float = field(default=0.35)
+    min_subspace_rank: int = field(default=4)
+    conflict_anchor_strength: float = field(default=0.65)
     save_as_tied_params: bool = field(default=False)
     overwrite_merged_model: bool = field(default=False)
 

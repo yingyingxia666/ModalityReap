@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 import math  # For pi constant in comments
 from typing import List, Dict, Callable
+
 import logging
 
 

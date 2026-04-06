@@ -1,21 +1,13 @@
-"""
-Module for merging experts in Mixture of Experts (MoE) layers based on pre-defined clusters.
-"""
+from __future__ import annotations
 
-import torch
-import torch.nn as nn
 import logging
-from typing import Dict, List, Optional, Union, Any, Callable
 from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Union
+
 import torch
 import torch.nn as nn
 
-from modality_reap.model_util import MODEL_ATTRS
 from modality_reap.permute import (
-    DirectAlignmentPermuter,
-    assert_improved_weight_dist,
-    assert_not_equal,
-    assert_invariance,
     PERMUTER_REGISTRY,
 )
 
@@ -33,6 +25,7 @@ class MergeMethod(str, Enum):
     SCE = "sce"
     KARCHER = "karcher"
     SUBMOE = "submoe"
+    CONFLICT_AWARE_SUBSPACE = "conflict_aware_subspace"
 
 
 class MoEExpertMerger:
@@ -50,6 +43,7 @@ class MoEExpertMerger:
         dom_as_base: bool = True,
         permute: str | None = None,
         tie_tensors: bool = False,
+        cluster_conflict: dict[int, float] | None = None,
         **merge_kwargs,
     ):
         """
@@ -74,6 +68,7 @@ class MoEExpertMerger:
         self.dom_as_base = dom_as_base
         self.permute = permute
         self.tie_tensors = tie_tensors
+        self.cluster_conflict = cluster_conflict or {}
         self.merge_method = (
             MergeMethod(merge_method) if isinstance(merge_method, str) else merge_method
         )
@@ -89,6 +84,9 @@ class MoEExpertMerger:
         merge_fn = self._get_merge_function()
         # Process each cluster
         for cluster_id in self.cluster_label.unique():
+            cluster_id_value = int(cluster_id.item())
+            if cluster_id_value < 0:
+                continue
             experts = getattr(self.moe, self.model_attrs["experts"])
             expert_indices = torch.where(self.cluster_label == cluster_id)[0].tolist()
             if len(expert_indices) == 1:
@@ -135,7 +133,13 @@ class MoEExpertMerger:
 
             # Group corresponding parameters across experts
             for param_name in dom_tensors:
-                if self.dom_as_base and self.merge_method in [MergeMethod.TIES, MergeMethod.MULTISLERP, MergeMethod.SCE, MergeMethod.KARCHER]:
+                if self.dom_as_base and self.merge_method in [
+                    MergeMethod.TIES,
+                    MergeMethod.MULTISLERP,
+                    MergeMethod.SCE,
+                    MergeMethod.KARCHER,
+                    MergeMethod.CONFLICT_AWARE_SUBSPACE,
+                ]:
                     base = dom_tensors[param_name]
                     tensors_to_merge = [t[param_name] for t in other_tensors]
                     tensor_weights = self.expert_proba[non_dom_indices]
@@ -156,6 +160,7 @@ class MoEExpertMerger:
                     tensors=tensors_to_merge,
                     tensor_weights=tensor_weights,
                     base_tensor=base,
+                    cluster_conflict=self.cluster_conflict.get(cluster_id_value, 0.0),
                     **self.merge_kwargs,
                 )
                 if self.tie_tensors:
@@ -190,6 +195,8 @@ class MoEExpertMerger:
             return karcher_merge_tensors
         elif self.merge_method == MergeMethod.SUBMOE:
             return submoe
+        elif self.merge_method == MergeMethod.CONFLICT_AWARE_SUBSPACE:
+            return self._conflict_aware_subspace_merge
 
         else:
             raise NotImplementedError(f"Unknown merge method {self.merge_method}")
@@ -200,7 +207,7 @@ class MoEExpertMerger:
         tensor_weights: torch.Tensor | None = None,
         **kwargs,
     ) -> nn.Module:
-        if getattr(kwargs, "base_tensor", None) is not None:
+        if kwargs.get("base_tensor") is not None:
             raise ValueError(
                 "The frequency weighted average merge does not support a base tensor."
             )
@@ -214,6 +221,84 @@ class MoEExpertMerger:
             torch.sum(tensor_weights, dim=0) + FP32_EPS
         )
         return merged_tensor
+
+    @staticmethod
+    def _conflict_aware_subspace_merge(
+        tensors: List[torch.Tensor],
+        tensor_weights: torch.Tensor | None = None,
+        *,
+        base_tensor: torch.Tensor | None = None,
+        cluster_conflict: float = 0.0,
+        subspace_rank_ratio: float = 0.35,
+        min_subspace_rank: int = 4,
+        conflict_anchor_strength: float = 0.65,
+        **kwargs,
+    ) -> torch.Tensor:
+        if len(tensors) == 1 and base_tensor is None:
+            return tensors[0]
+
+        if tensor_weights is None:
+            tensor_weights = torch.ones(
+                len(tensors), dtype=torch.float32, device=tensors[0].device
+            )
+        else:
+            tensor_weights = tensor_weights.to(
+                dtype=torch.float32, device=tensors[0].device
+            )
+        tensor_weights = tensor_weights / tensor_weights.sum().clamp(min=FP32_EPS)
+
+        if base_tensor is not None:
+            anchor_tensor = base_tensor.to(torch.float32)
+            merge_tensors = [base_tensor] + tensors
+            merge_weights = torch.cat(
+                (
+                    torch.tensor(
+                        [float(kwargs.get("conservative_anchor_weight", 1.0))],
+                        dtype=torch.float32,
+                        device=tensor_weights.device,
+                    ),
+                    tensor_weights,
+                )
+            )
+        else:
+            merge_tensors = tensors
+            merge_weights = tensor_weights
+            dominant_idx = int(torch.argmax(merge_weights).item())
+            anchor_tensor = merge_tensors[dominant_idx].to(torch.float32)
+
+        merge_weights = merge_weights / merge_weights.sum().clamp(min=FP32_EPS)
+        stacked = torch.stack(
+            [tensor.to(torch.float32) for tensor in merge_tensors], dim=0
+        )
+        weighted_mean = torch.sum(
+            stacked * merge_weights.view(-1, *([1] * (stacked.dim() - 1))), dim=0
+        )
+
+        if weighted_mean.dim() < 2:
+            residual_mean = weighted_mean
+        else:
+            rows = weighted_mean.shape[0]
+            cols = int(weighted_mean.numel() / max(rows, 1))
+            matrix = weighted_mean.reshape(rows, cols)
+            max_rank = min(matrix.shape)
+            if max_rank <= 1:
+                residual_mean = weighted_mean
+            else:
+                conflict_scale = min(max(float(cluster_conflict), 0.0), 1.0)
+                rank_ratio = max(0.05, float(subspace_rank_ratio) * (1.0 - 0.5 * conflict_scale))
+                rank = min(max_rank, max(int(round(max_rank * rank_ratio)), int(min_subspace_rank)))
+                u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+                shared_component = (u[:, :rank] * s[:rank]) @ vh[:rank, :]
+                residual_mean = shared_component.reshape_as(weighted_mean)
+
+        residuals = stacked - residual_mean
+        residual_average = torch.sum(
+            residuals * merge_weights.view(-1, *([1] * (residuals.dim() - 1))), dim=0
+        )
+        anchor_residual = anchor_tensor - residual_mean
+        anchor_mix = min(max(float(cluster_conflict) * float(conflict_anchor_strength), 0.0), 1.0)
+        merged_tensor = residual_mean + (1.0 - anchor_mix) * residual_average + anchor_mix * anchor_residual
+        return merged_tensor.to(tensors[0].dtype)
 
     @staticmethod
     def _ties_merge(
@@ -655,7 +740,7 @@ def expert_weight_similarity(
 
 @torch.no_grad()
 def submoe(tensors, tensor_weights, **kwargs):
-    if getattr(kwargs, "base_tensor", None) is not None:
+    if kwargs.get("base_tensor") is not None:
         raise ValueError(
             "SubMoE merge does not support dom_as_base=True."
         )

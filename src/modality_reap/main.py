@@ -22,7 +22,6 @@ from modality_reap.args import (
     ensure_output_dir,
 )
 from modality_reap.cluster import (
-    apply_protected_expert_constraints,
     dynamic_frequency_penalized_clustering,
     get_penalty_vector,
     hierarchical_clustering,
@@ -34,6 +33,12 @@ from modality_reap.model_util import MODEL_ATTRS, assert_merge, get_moe
 from modality_reap.observer import MoETransformerObserver, OBSERVER_CONFIG_REGISTRY
 from modality_reap.reporting import save_json, summarize_warnings
 from modality_reap.scoring import save_scores, score_experts, select_protected_experts
+from modality_reap.strategy import (
+    LayerCompressionPlan,
+    build_cluster_conflict_scores,
+    build_hybrid_compression_plan,
+    build_layer_adaptive_schedule,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -125,11 +130,12 @@ def cluster_layer(distances: torch.Tensor, expert_prob: torch.Tensor, num_cluste
 def build_cluster_labels(
     observation_data: dict[int, dict[str, Any]],
     cluster_args: ClusterArgs,
-    protected_experts: dict[int, list[int]],
+    compression_plans: dict[int, LayerCompressionPlan],
 ) -> dict[int, torch.Tensor]:
     logger.info("[阶段 5/8] 开始逐层聚类")
     cluster_labels: dict[int, torch.Tensor] = {}
     for layer_idx, layer_state in tqdm(sorted(observation_data.items()), desc="Clustering layers", unit="layer"):
+        compression_plan = compression_plans[layer_idx]
         expert_prob = layer_state["expert_frequency"].to(torch.float32)
         total = expert_prob.sum()
         if total > 0:
@@ -139,13 +145,31 @@ def build_cluster_labels(
             distance = layer_state["online_characteristic_activation_dist"]
         distance = distance.to(torch.float32)
         num_experts = expert_prob.shape[0]
-        num_protected = len(protected_experts.get(layer_idx, []))
-        requested_clusters = cluster_args.num_clusters or int(num_experts * (1 - cluster_args.compression_ratio))
-        requested_clusters = max(requested_clusters, num_protected, 1)
-        requested_clusters = min(requested_clusters, num_experts)
-        cluster_labels[layer_idx] = cluster_layer(distance, expert_prob, requested_clusters, cluster_args)
+        labels = torch.full((num_experts,), -1, dtype=torch.long)
+        next_cluster_id = 0
 
-    cluster_labels = apply_protected_expert_constraints(cluster_labels, protected_experts)
+        for expert_id in compression_plan.keep_experts:
+            if expert_id < num_experts:
+                labels[expert_id] = next_cluster_id
+                next_cluster_id += 1
+
+        merge_experts = [expert_id for expert_id in compression_plan.merge_experts if expert_id < num_experts]
+        merge_cluster_count = min(compression_plan.merge_cluster_count, len(merge_experts))
+        if merge_experts:
+            if merge_cluster_count <= 0:
+                raise RuntimeError(f"Layer {layer_idx} has merge candidates but zero merge clusters.")
+            if merge_cluster_count == len(merge_experts):
+                merge_sub_labels = torch.arange(len(merge_experts), dtype=torch.long)
+            else:
+                merge_indices = torch.tensor(merge_experts, dtype=torch.long)
+                merge_distance = distance.index_select(0, merge_indices).index_select(1, merge_indices)
+                merge_prob = expert_prob.index_select(0, merge_indices)
+                merge_sub_labels = cluster_layer(merge_distance, merge_prob, merge_cluster_count, cluster_args)
+            for local_idx, expert_id in enumerate(merge_experts):
+                labels[expert_id] = next_cluster_id + int(merge_sub_labels[local_idx].item())
+            next_cluster_id += merge_cluster_count
+
+        cluster_labels[layer_idx] = labels
     logger.info("聚类完成，共处理 %d 层", len(cluster_labels))
     return cluster_labels
 
@@ -155,23 +179,16 @@ def merge_model(
     cluster_labels: dict[int, torch.Tensor],
     observation_data: dict[int, dict[str, Any]],
     merge_args: MergeArgs,
-    protected_experts: dict[int, list[int]],
+    layer_scores: dict[int, dict[str, Any]],
 ):
     logger.info("[阶段 6/8] 开始 merge experts")
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    cluster_conflict_scores = build_cluster_conflict_scores(layer_scores, cluster_labels)
     for layer_idx, cluster_label in tqdm(sorted(cluster_labels.items()), desc="Merging layers", unit="layer"):
         expert_proba = observation_data[layer_idx]["expert_frequency"].to(torch.float32)
         total = expert_proba.sum()
         if total > 0:
             expert_proba = expert_proba / total
-
-        protected = set(protected_experts.get(layer_idx, []))
-        if protected:
-            adjusted = expert_proba.clone()
-            for expert_id in protected:
-                if expert_id < adjusted.shape[0]:
-                    adjusted[expert_id] = adjusted[expert_id] + merge_args.conservative_anchor_weight
-            expert_proba = adjusted / adjusted.sum()
 
         moe = get_moe(model, layer_idx)
         merger = MoEExpertMerger(
@@ -180,10 +197,15 @@ def merge_model(
             expert_proba=expert_proba,
             model_attrs=model_attrs,
             merge_method=MergeMethod(merge_args.merge_method),
-            dom_as_base=merge_args.dom_as_base,
+            dom_as_base=merge_args.dom_as_base or merge_args.merge_method == MergeMethod.CONFLICT_AWARE_SUBSPACE.value,
             select_top_k=merge_args.select_top_k,
             permute=merge_args.permute,
             tie_tensors=merge_args.save_as_tied_params,
+            conservative_anchor_weight=merge_args.conservative_anchor_weight,
+            subspace_rank_ratio=merge_args.subspace_rank_ratio,
+            min_subspace_rank=merge_args.min_subspace_rank,
+            conflict_anchor_strength=merge_args.conflict_anchor_strength,
+            cluster_conflict=cluster_conflict_scores.get(layer_idx, {}),
         )
         merger.merge_experts()
         assert_merge(model, moe, cluster_label)
@@ -192,26 +214,30 @@ def merge_model(
 
 def compact_fused_experts(model, cluster_labels: dict[int, torch.Tensor], observation_data: dict[int, dict[str, Any]]):
     logger.info("[阶段 7/8] 开始 compact experts")
+    layer_num_experts: dict[int, int] = {}
     for layer_idx, cluster_label in tqdm(sorted(cluster_labels.items()), desc="Compacting layers", unit="layer"):
         moe = get_moe(model, layer_idx)
         expert_proba = observation_data[layer_idx]["expert_frequency"].to(torch.float32)
         retained: list[int] = []
-        for cluster_id in torch.unique(cluster_label).tolist():
+        for cluster_id in sorted(cluster_id for cluster_id in torch.unique(cluster_label).tolist() if cluster_id >= 0):
             members = torch.where(cluster_label == cluster_id)[0]
             best_idx = members[expert_proba[members].argmax()].item()
             retained.append(best_idx)
         retained = sorted(retained)
+        if not retained:
+            raise RuntimeError(f"Layer {layer_idx} has no retained experts after compression.")
 
         moe.experts.gate_up_proj = torch.nn.Parameter(moe.experts.gate_up_proj.data[retained].clone())
         moe.experts.down_proj = torch.nn.Parameter(moe.experts.down_proj.data[retained].clone())
         moe.experts.num_experts = len(retained)
         moe.gate.weight = torch.nn.Parameter(moe.gate.weight.data[retained].clone())
         moe.gate.num_experts = len(retained)
+        layer_num_experts[layer_idx] = len(retained)
 
-    first_layer = next(iter(cluster_labels))
-    new_count = len(torch.unique(cluster_labels[first_layer]))
-    model.config.thinker_config.text_config.num_experts = new_count
-    logger.info("compact 完成，第一层压缩后 expert 数: %d", new_count)
+    layer_expert_counts = [layer_num_experts[layer_idx] for layer_idx in sorted(layer_num_experts)]
+    model.config.thinker_config.text_config.num_experts = max(layer_expert_counts)
+    setattr(model.config.thinker_config.text_config, "num_experts_per_layer", layer_expert_counts)
+    logger.info("compact 完成，各层压缩后 expert 数: %s", layer_expert_counts)
 
 
 def save_run_artifacts(
@@ -221,6 +247,8 @@ def save_run_artifacts(
     observation_sets: dict[str, dict[int, dict[str, Any]]],
     cluster_labels: dict[int, torch.Tensor],
     protected_experts: dict[int, list[int]],
+    layer_schedule: dict[int, dict[str, Any]],
+    compression_plans: dict[int, LayerCompressionPlan],
 ):
     save_json(output_dir / "run_args.json", run_args)
     save_json(output_dir / "warnings.json", summarize_warnings(warnings))
@@ -241,10 +269,20 @@ def save_run_artifacts(
         str(layer_idx): {
             "labels": labels.tolist(),
             "protected_experts": protected_experts.get(layer_idx, []),
+            "pruned_experts": compression_plans[layer_idx].pruned_experts,
+            "merge_experts": compression_plans[layer_idx].merge_experts,
         }
         for layer_idx, labels in cluster_labels.items()
     }
     save_json(output_dir / "clusters" / "clusters.json", serializable_clusters)
+    save_json(
+        output_dir / "plans" / "layer_schedule.json",
+        {str(layer_idx): schedule for layer_idx, schedule in layer_schedule.items()},
+    )
+    save_json(
+        output_dir / "plans" / "compression_plan.json",
+        {str(layer_idx): plan.to_dict() for layer_idx, plan in compression_plans.items()},
+    )
 
 
 def smoke_test(model, tokenizer):
@@ -321,18 +359,64 @@ def main():
 
     logger.info("[阶段 4/8] 计算模态打分与保护专家")
     layer_scores = score_experts(observation_sets, use_router_analysis_prior=cluster_args.use_router_analysis_prior)
-    protected_experts = select_protected_experts(
-        layer_scores,
-        protect_ratio=cluster_args.audio_protect_ratio,
-        protect_middle_layers=cluster_args.protect_middle_layers,
-        middle_layer_multiplier=cluster_args.middle_layer_multiplier,
-    )
+    layer_schedule = build_layer_adaptive_schedule(layer_scores, cluster_args)
+    if cluster_args.use_hybrid_strategy:
+        compression_plans = build_hybrid_compression_plan(layer_scores, layer_schedule, cluster_args)
+        protected_experts = {
+            layer_idx: plan.keep_experts
+            for layer_idx, plan in compression_plans.items()
+        }
+    else:
+        protected_experts = select_protected_experts(
+            layer_scores,
+            protect_ratio=cluster_args.audio_protect_ratio,
+            protect_middle_layers=cluster_args.protect_middle_layers,
+            middle_layer_multiplier=cluster_args.middle_layer_multiplier,
+        )
+        compression_plans = {}
+        for layer_idx, score_dict in layer_scores.items():
+            num_experts = int(score_dict["audio_priority_score"].shape[0])
+            keep_experts = protected_experts.get(layer_idx, [])
+            target_experts = max(int(layer_schedule[layer_idx]["target_experts"]), len(keep_experts), 1)
+            merge_experts = [expert_idx for expert_idx in range(num_experts) if expert_idx not in set(keep_experts)]
+            merge_budget = max(target_experts - len(keep_experts), 0)
+            if len(merge_experts) > merge_budget:
+                merge_experts = merge_experts[:merge_budget]
+            pruned_experts = [
+                expert_idx for expert_idx in range(num_experts)
+                if expert_idx not in set(keep_experts) and expert_idx not in set(merge_experts)
+            ]
+            decision_labels = ["prune"] * num_experts
+            for expert_idx in merge_experts:
+                decision_labels[expert_idx] = "merge"
+            for expert_idx in keep_experts:
+                decision_labels[expert_idx] = "keep_audio"
+            compression_plans[layer_idx] = LayerCompressionPlan(
+                layer_idx=layer_idx,
+                num_experts=num_experts,
+                target_experts=target_experts,
+                target_compression_ratio=float(layer_schedule[layer_idx]["compression_ratio"]),
+                sensitivity_score=float(layer_schedule[layer_idx]["sensitivity_score"]),
+                normalized_sensitivity=float(layer_schedule[layer_idx]["normalized_sensitivity"]),
+                merge_cluster_count=min(len(merge_experts), merge_budget),
+                keep_experts=keep_experts,
+                audio_core_experts=keep_experts,
+                shared_experts=[],
+                merge_experts=merge_experts,
+                pruned_experts=pruned_experts,
+                decision_labels=decision_labels,
+                layer_stats={
+                    key: float(value) if isinstance(value, (int, float)) else float(value)
+                    for key, value in layer_schedule[layer_idx].items()
+                    if key != "target_experts"
+                },
+            )
     save_scores(output_dir / "scores", layer_scores, protected_experts)
     logger.info("打分完成，共 %d 层；保护专家已保存到 %s", len(layer_scores), output_dir / "scores")
 
     clustering_observation = observation_sets.get("audio") or observation_sets.get("text")
-    cluster_labels = build_cluster_labels(clustering_observation, cluster_args, protected_experts)
-    merge_model(model, cluster_labels, clustering_observation, merge_args, protected_experts)
+    cluster_labels = build_cluster_labels(clustering_observation, cluster_args, compression_plans)
+    merge_model(model, cluster_labels, clustering_observation, merge_args, layer_scores)
     compact_fused_experts(model, cluster_labels, clustering_observation)
 
     if reap_args.do_save:
@@ -358,6 +442,8 @@ def main():
         observation_sets=observation_sets,
         cluster_labels=cluster_labels,
         protected_experts=protected_experts,
+        layer_schedule=layer_schedule,
+        compression_plans=compression_plans,
     )
     logger.info("实验产物已写入: %s", output_dir)
 

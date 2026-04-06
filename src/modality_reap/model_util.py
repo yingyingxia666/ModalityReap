@@ -147,6 +147,8 @@ def assert_merge(model, merged_moe, cluster_label):
 
     if model_attr["fused"]:
         for cluster_id in cluster_label.unique():
+            if int(cluster_id.item()) < 0:
+                continue
             expert_indices = torch.where(cluster_label == cluster_id)[0]
             dom_expert = expert_indices[0]
             for expert in expert_indices[1:]:
@@ -161,6 +163,8 @@ def assert_merge(model, merged_moe, cluster_label):
     else:
         up_proj = model_attr["up_proj"]
         for cluster_id in cluster_label.unique():
+            if int(cluster_id.item()) < 0:
+                continue
             expert_indices = torch.where(cluster_label == cluster_id)[0]
             dom_expert = expert_indices[0]
             for expert in expert_indices[1:]:

@@ -9,8 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torchaudio
 from transformers import AutoProcessor
+
+try:
+    import torchaudio
+except (ImportError, OSError):
+    torchaudio = None
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +162,9 @@ def _extract_audio_paths_from_messages(messages: list[dict[str, Any]], base_path
 
 def load_audio_tensor(audio_path: str, target_sample_rate: int) -> torch.Tensor | None:
     if not audio_path or not os.path.exists(audio_path):
+        return None
+    if torchaudio is None:
+        logger.warning("torchaudio is unavailable; skip loading audio file %s", audio_path)
         return None
     try:
         audio_tensor, sample_rate = torchaudio.load(audio_path)
