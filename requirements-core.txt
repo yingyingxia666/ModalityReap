@@ -1,0 +1,62 @@
+# ModalityReap 核心依赖
+# 适用于手动分步安装的场景
+# PyTorch 系列需单独通过 --index-url 安装，见 ENVIRONMENT_SETUP.md
+#
+# 安装命令：pip install -r requirements-core.txt
+
+# ---------- HuggingFace 生态 ----------
+transformers==5.2.0
+accelerate==1.12.0
+datasets==3.6.0
+huggingface-hub==1.4.1
+tokenizers==0.22.2
+safetensors==0.7.0
+sentencepiece==0.2.1
+
+# ---------- 音频处理 ----------
+librosa==0.11.0
+soundfile==0.13.1
+audioread==3.1.0
+soxr==1.0.0
+av==16.1.0
+
+# ---------- 科学计算 ----------
+numpy==2.2.6
+scipy==1.17.0
+scikit-learn==1.8.0
+
+# ---------- 数据处理 ----------
+tqdm==4.67.3
+pyyaml==6.0.3
+python-dotenv==1.2.1
+pyarrow==23.0.0
+pandas==3.0.0
+
+# ---------- 评测指标 ----------
+rouge-score==0.1.2
+sacrebleu==2.6.0
+nltk==3.9.2
+lm-eval==0.4.10
+
+# ---------- 可视化（可选） ----------
+matplotlib==3.10.8
+seaborn==0.13.2
+plotly==6.5.2
+
+# ---------- 训练工具（可选） ----------
+trl==0.22.2
+deepspeed==0.18.5
+
+# ---------- 推理 / 部署（可选） ----------
+# vllm==0.10.0       # 需和 torch CUDA 版本对齐，建议单独安装
+# xformers==0.0.31   # Flash-Attention 支持，可用 sdpa 替代
+
+# ---------- 开发 / 测试 ----------
+pytest==9.0.2
+pytest-timeout==2.4.0
+ipython==9.10.0
+
+# ---------- 其他工具 ----------
+wandb==0.24.2
+openai==1.90.0
+rich==14.3.2
