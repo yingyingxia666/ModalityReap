@@ -10,6 +10,40 @@ from scipy.cluster.vq import kmeans2
 import logging
 
 
+def ensure_symmetric_distance_matrix(
+    distances: torch.Tensor,
+    diagonal: float = 0.0,
+) -> torch.Tensor:
+    """Normalize pairwise distances for SciPy clustering utilities.
+
+    Real observation statistics can contain tiny asymmetry and occasional non-finite
+    values due to floating-point accumulation. SciPy's ``squareform`` requires a
+    strictly symmetric, finite matrix, so we sanitize it once here.
+    """
+    if distances.dim() != 2 or distances.shape[0] != distances.shape[1]:
+        raise ValueError(
+            f"Expected a square distance matrix, got shape={tuple(distances.shape)}."
+        )
+
+    matrix = distances.detach().clone().to(torch.float32)
+    matrix = 0.5 * (matrix + matrix.transpose(0, 1))
+    matrix = matrix.clamp_min(0.0)
+
+    finite_mask = torch.isfinite(matrix)
+    if finite_mask.any():
+        replacement = float(matrix[finite_mask].max().item())
+    else:
+        replacement = 0.0
+    matrix = torch.nan_to_num(
+        matrix,
+        nan=replacement,
+        posinf=replacement,
+        neginf=0.0,
+    )
+    matrix.fill_diagonal_(float(diagonal))
+    return matrix
+
+
 def get_penalty_vector(
     expert_probablities: torch.Tensor,
     temperature: float | None = None,
@@ -99,7 +133,10 @@ def hierarchical_clustering(
     method: str,
     n_clusters: int,
 ):
-    condensed_dist = squareform(distances.fill_diagonal_(0))
+    condensed_dist = squareform(
+        ensure_symmetric_distance_matrix(distances, diagonal=0.0).cpu().numpy().astype(np.float64),
+        checks=False,
+    )
     all_clusters = linkage(condensed_dist, method=method)
     cluster_labels = linkage_to_labels(all_clusters, n_clusters)
     return cluster_labels
@@ -198,8 +235,10 @@ def multi_layer_hierarchical_clustering(
     sorted_layer_indices = sorted(distances.keys())
 
     for layer_idx in sorted_layer_indices:
-        # distances[layer_idx].fill_diagonal_(float("inf"))
-        distances[layer_idx].fill_diagonal_(0.) # Set diagonal to 0 for squareform fn
+        distances[layer_idx] = ensure_symmetric_distance_matrix(
+            distances[layer_idx],
+            diagonal=0.0,
+        )
 
     for i in range(0, len(sorted_layer_indices), num_layers):
         layer_indices_in_group = sorted_layer_indices[i : i + num_layers]
@@ -220,7 +259,7 @@ def multi_layer_hierarchical_clustering(
         target_total_clusters = n_clusters * num_layers_in_group
 
         linkage_matrices = [
-            linkage(squareform(d.cpu().numpy().astype(np.float64)), method=method)
+            linkage(squareform(d.cpu().numpy().astype(np.float64), checks=False), method=method)
             for d in group_distances
         ]
 
@@ -591,6 +630,7 @@ def restricted_hierarchical_clustering(
     n_samples = distances.shape[0]
     final_labels = torch.arange(n_samples, dtype=torch.int)
     next_cluster_id = n_samples
+    distances = ensure_symmetric_distance_matrix(distances, diagonal=0.0)
     distances = distances.fill_diagonal_(float("inf"))
     cluster_sizes = torch.full((n_samples,), 1.0, dtype=torch.float)
 

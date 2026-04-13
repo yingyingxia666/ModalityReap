@@ -19,6 +19,7 @@ class ReapArgs:
 class ModelArgs:
     model_name: str = field(default="/data/szs/share/Qwen3-Omni-30B-A3B-Instruct")
     attn_implementation: str = field(default="sdpa")
+    disable_talker: bool = field(default=True)
 
 
 @dataclass

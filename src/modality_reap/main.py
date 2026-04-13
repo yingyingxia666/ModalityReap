@@ -44,6 +44,23 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+@dataclasses.dataclass
+class CompressionRunResult:
+    output_dir: Path
+    model: Any
+    processor: Any
+    tokenizer: Any
+    warnings: list[str]
+    observation_sets: dict[str, dict[int, dict[str, Any]]]
+    layer_scores: dict[int, dict[str, Any]]
+    layer_schedule: dict[int, dict[str, Any]]
+    compression_plans: dict[int, LayerCompressionPlan]
+    protected_experts: dict[int, list[int]]
+    cluster_labels: dict[int, torch.Tensor]
+    layer_num_experts: dict[int, int]
+    merged_model_dir: Path | None
+
+
 def parse_args() -> tuple[ReapArgs, ModelArgs, DataArgs, ObserverArgs, ClusterArgs, MergeArgs, ReportArgs]:
     parser = HfArgumentParser((ReapArgs, ModelArgs, DataArgs, ObserverArgs, ClusterArgs, MergeArgs, ReportArgs))
     return parser.parse_args_into_dataclasses()
@@ -60,6 +77,9 @@ def load_model_and_processors(model_args: ModelArgs):
         trust_remote_code=True,
         attn_implementation=model_args.attn_implementation,
     )
+    if model_args.disable_talker and hasattr(model, "disable_talker"):
+        model.disable_talker()
+        logger.info("已禁用 talker，仅保留文本输出以节省显存")
     model.eval()
     processor = AutoProcessor.from_pretrained(model_args.model_name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name, trust_remote_code=True)
@@ -70,6 +90,50 @@ def load_model_and_processors(model_args: ModelArgs):
 def summarize_sample_sources(samples: list[dict[str, Any]]) -> str:
     counter = Counter(sample["dataset"] for sample in samples)
     return ", ".join(f"{name}={count}" for name, count in sorted(counter.items()))
+
+
+def prepare_modality_samples(
+    processor,
+    data_args: DataArgs,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    logger.info("[阶段 2/8] 准备音频与文本样本")
+    audio_samples, audio_warnings = load_modality_samples(
+        processor=processor,
+        modality="audio",
+        max_datasets=data_args.max_audio_datasets,
+        max_samples_per_dataset=data_args.max_samples_per_dataset,
+        sample_seed=data_args.sample_seed,
+        max_seq_length=data_args.max_seq_length,
+        audio_sample_rate=data_args.audio_sample_rate,
+        dataset_root=data_args.dataset_root,
+        total_samples=data_args.total_audio_samples,
+    )
+    text_samples, text_warnings = load_modality_samples(
+        processor=processor,
+        modality="text",
+        max_datasets=data_args.max_text_datasets,
+        max_samples_per_dataset=data_args.max_samples_per_dataset,
+        sample_seed=data_args.sample_seed,
+        max_seq_length=data_args.max_seq_length,
+        audio_sample_rate=data_args.audio_sample_rate,
+        dataset_root=data_args.dataset_root,
+        total_samples=data_args.total_text_samples,
+    )
+    warnings = audio_warnings + text_warnings
+
+    logger.info(
+        "音频样本准备完成: %d 条 (%s)",
+        len(audio_samples),
+        summarize_sample_sources(audio_samples) if audio_samples else "none",
+    )
+    logger.info(
+        "文本样本准备完成: %d 条 (%s)",
+        len(text_samples),
+        summarize_sample_sources(text_samples) if text_samples else "none",
+    )
+    if warnings:
+        logger.warning("样本准备告警: %s", warnings)
+    return audio_samples, text_samples, warnings
 
 
 def collect_observations(
@@ -96,6 +160,22 @@ def collect_observations(
         return state
     finally:
         observer.close_hooks()
+
+
+def collect_observation_sets(
+    model,
+    audio_samples: list[dict[str, Any]],
+    text_samples: list[dict[str, Any]],
+    obs_args: ObserverArgs,
+) -> dict[str, dict[int, dict[str, Any]]]:
+    observation_sets: dict[str, dict[int, dict[str, Any]]] = {}
+    if audio_samples:
+        observation_sets["audio"] = collect_observations(model, audio_samples, obs_args, stage_name="audio")
+    if text_samples:
+        observation_sets["text"] = collect_observations(model, text_samples, obs_args, stage_name="text")
+    if not observation_sets:
+        raise RuntimeError("No available datasets were loaded. Please verify dataset paths or provide local JSONL data.")
+    return observation_sets
 
 
 def cluster_layer(distances: torch.Tensor, expert_prob: torch.Tensor, num_clusters: int, cluster_args: ClusterArgs) -> torch.Tensor:
@@ -180,6 +260,7 @@ def merge_model(
     observation_data: dict[int, dict[str, Any]],
     merge_args: MergeArgs,
     layer_scores: dict[int, dict[str, Any]],
+    validate_merge: bool = True,
 ):
     logger.info("[阶段 6/8] 开始 merge experts")
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
@@ -208,7 +289,8 @@ def merge_model(
             cluster_conflict=cluster_conflict_scores.get(layer_idx, {}),
         )
         merger.merge_experts()
-        assert_merge(model, moe, cluster_label)
+        if validate_merge:
+            assert_merge(model, moe, cluster_label)
     logger.info("merge 完成")
 
 
@@ -232,12 +314,97 @@ def compact_fused_experts(model, cluster_labels: dict[int, torch.Tensor], observ
         moe.experts.num_experts = len(retained)
         moe.gate.weight = torch.nn.Parameter(moe.gate.weight.data[retained].clone())
         moe.gate.num_experts = len(retained)
+        if hasattr(moe.gate, "top_k"):
+            moe.gate.top_k = min(int(moe.gate.top_k), len(retained))
         layer_num_experts[layer_idx] = len(retained)
 
     layer_expert_counts = [layer_num_experts[layer_idx] for layer_idx in sorted(layer_num_experts)]
     model.config.thinker_config.text_config.num_experts = max(layer_expert_counts)
     setattr(model.config.thinker_config.text_config, "num_experts_per_layer", layer_expert_counts)
     logger.info("compact 完成，各层压缩后 expert 数: %s", layer_expert_counts)
+    return layer_num_experts
+
+
+def build_nonhybrid_compression_plans(
+    layer_scores: dict[int, dict[str, Any]],
+    layer_schedule: dict[int, dict[str, Any]],
+    cluster_args: ClusterArgs,
+    protected_experts: dict[int, list[int]],
+) -> dict[int, LayerCompressionPlan]:
+    compression_plans: dict[int, LayerCompressionPlan] = {}
+    for layer_idx, score_dict in layer_scores.items():
+        num_experts = int(score_dict["audio_priority_score"].shape[0])
+        keep_experts = protected_experts.get(layer_idx, [])
+        keep_set = set(keep_experts)
+        target_experts = max(int(layer_schedule[layer_idx]["target_experts"]), len(keep_experts), 1)
+        merge_experts = [expert_idx for expert_idx in range(num_experts) if expert_idx not in keep_set]
+        merge_budget = max(target_experts - len(keep_experts), 0)
+        if len(merge_experts) > merge_budget:
+            merge_experts = merge_experts[:merge_budget]
+        merge_set = set(merge_experts)
+        pruned_experts = [
+            expert_idx
+            for expert_idx in range(num_experts)
+            if expert_idx not in keep_set and expert_idx not in merge_set
+        ]
+        decision_labels = ["prune"] * num_experts
+        for expert_idx in merge_experts:
+            decision_labels[expert_idx] = "merge"
+        for expert_idx in keep_experts:
+            decision_labels[expert_idx] = "keep_audio"
+        compression_plans[layer_idx] = LayerCompressionPlan(
+            layer_idx=layer_idx,
+            num_experts=num_experts,
+            target_experts=target_experts,
+            target_compression_ratio=float(layer_schedule[layer_idx]["compression_ratio"]),
+            sensitivity_score=float(layer_schedule[layer_idx]["sensitivity_score"]),
+            normalized_sensitivity=float(layer_schedule[layer_idx]["normalized_sensitivity"]),
+            merge_cluster_count=min(len(merge_experts), merge_budget),
+            keep_experts=keep_experts,
+            audio_core_experts=keep_experts,
+            shared_experts=[],
+            merge_experts=merge_experts,
+            pruned_experts=pruned_experts,
+            decision_labels=decision_labels,
+            layer_stats={
+                key: float(value) if isinstance(value, (int, float)) else float(value)
+                for key, value in layer_schedule[layer_idx].items()
+                if key != "target_experts"
+            },
+        )
+    return compression_plans
+
+
+def build_compression_plan(
+    output_dir: Path,
+    observation_sets: dict[str, dict[int, dict[str, Any]]],
+    cluster_args: ClusterArgs,
+) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[int, LayerCompressionPlan], dict[int, list[int]]]:
+    logger.info("[阶段 4/8] 计算模态打分与保护专家")
+    layer_scores = score_experts(observation_sets, use_router_analysis_prior=cluster_args.use_router_analysis_prior)
+    layer_schedule = build_layer_adaptive_schedule(layer_scores, cluster_args)
+    if cluster_args.use_hybrid_strategy:
+        compression_plans = build_hybrid_compression_plan(layer_scores, layer_schedule, cluster_args)
+        protected_experts = {
+            layer_idx: plan.keep_experts
+            for layer_idx, plan in compression_plans.items()
+        }
+    else:
+        protected_experts = select_protected_experts(
+            layer_scores,
+            protect_ratio=cluster_args.audio_protect_ratio,
+            protect_middle_layers=cluster_args.protect_middle_layers,
+            middle_layer_multiplier=cluster_args.middle_layer_multiplier,
+        )
+        compression_plans = build_nonhybrid_compression_plans(
+            layer_scores=layer_scores,
+            layer_schedule=layer_schedule,
+            cluster_args=cluster_args,
+            protected_experts=protected_experts,
+        )
+    save_scores(output_dir / "scores", layer_scores, protected_experts)
+    logger.info("打分完成，共 %d 层；保护专家已保存到 %s", len(layer_scores), output_dir / "scores")
+    return layer_scores, layer_schedule, compression_plans, protected_experts
 
 
 def save_run_artifacts(
@@ -249,21 +416,32 @@ def save_run_artifacts(
     protected_experts: dict[int, list[int]],
     layer_schedule: dict[int, dict[str, Any]],
     compression_plans: dict[int, LayerCompressionPlan],
+    save_observation_artifacts: bool = True,
+    observation_artifact_reference: str | None = None,
 ):
     save_json(output_dir / "run_args.json", run_args)
     save_json(output_dir / "warnings.json", summarize_warnings(warnings))
 
-    serializable_observations = {
-        modality: {
-            str(layer_idx): {
-                key: value.tolist() if isinstance(value, torch.Tensor) else value
-                for key, value in layer_state.items()
+    if save_observation_artifacts:
+        serializable_observations = {
+            modality: {
+                str(layer_idx): {
+                    key: value.tolist() if isinstance(value, torch.Tensor) else value
+                    for key, value in layer_state.items()
+                }
+                for layer_idx, layer_state in layers.items()
             }
-            for layer_idx, layer_state in layers.items()
+            for modality, layers in observation_sets.items()
         }
-        for modality, layers in observation_sets.items()
-    }
-    save_json(output_dir / "observations" / "observations.json", serializable_observations)
+        save_json(output_dir / "observations" / "observations.json", serializable_observations)
+    elif observation_artifact_reference is not None:
+        save_json(
+            output_dir / "observations" / "reference.json",
+            {
+                "reused_observation_artifacts": True,
+                "source": observation_artifact_reference,
+            },
+        )
 
     serializable_clusters = {
         str(layer_idx): {
@@ -293,11 +471,36 @@ def smoke_test(model, tokenizer):
         add_generation_prompt=True,
         tokenize=True,
     ).to(next(model.parameters()).device)
-    _ = model.generate(inputs, max_new_tokens=16, do_sample=False)
+    _ = model.generate(inputs, max_new_tokens=16, do_sample=False, return_audio=False)
 
 
-def main():
-    reap_args, model_args, data_args, obs_args, cluster_args, merge_args, report_args = parse_args()
+def save_merged_model(model, tokenizer, output_dir: Path) -> Path:
+    logger.info("[阶段 8/8] 保存压缩模型与实验产物")
+    merged_model_dir = output_dir / "merged_model"
+    merged_model_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(merged_model_dir, safe_serialization=True)
+    tokenizer.save_pretrained(merged_model_dir)
+    logger.info("模型已保存到: %s", merged_model_dir)
+    return merged_model_dir
+
+
+def run_compression_pipeline(
+    reap_args: ReapArgs,
+    model_args: ModelArgs,
+    data_args: DataArgs,
+    obs_args: ObserverArgs,
+    cluster_args: ClusterArgs,
+    merge_args: MergeArgs,
+    report_args: ReportArgs,
+    *,
+    model=None,
+    processor=None,
+    tokenizer=None,
+    observation_sets: dict[str, dict[int, dict[str, Any]]] | None = None,
+    save_observation_artifacts: bool = True,
+    observation_artifact_reference: str | None = None,
+    validate_merge: bool = True,
+) -> CompressionRunResult:
     set_seed(reap_args.seed)
     output_dir = ensure_output_dir(data_args.output_dir)
 
@@ -309,123 +512,39 @@ def main():
         cluster_args.compression_ratio,
     )
 
-    model, processor, tokenizer = load_model_and_processors(model_args)
+    if model is None or processor is None or tokenizer is None:
+        model, processor, tokenizer = load_model_and_processors(model_args)
 
-    logger.info("[阶段 2/8] 准备音频与文本样本")
-    audio_samples, audio_warnings = load_modality_samples(
-        processor=processor,
-        modality="audio",
-        max_datasets=data_args.max_audio_datasets,
-        max_samples_per_dataset=data_args.max_samples_per_dataset,
-        sample_seed=data_args.sample_seed,
-        max_seq_length=data_args.max_seq_length,
-        audio_sample_rate=data_args.audio_sample_rate,
-        dataset_root=data_args.dataset_root,
-        total_samples=data_args.total_audio_samples,
-    )
-    text_samples, text_warnings = load_modality_samples(
-        processor=processor,
-        modality="text",
-        max_datasets=data_args.max_text_datasets,
-        max_samples_per_dataset=data_args.max_samples_per_dataset,
-        sample_seed=data_args.sample_seed,
-        max_seq_length=data_args.max_seq_length,
-        audio_sample_rate=data_args.audio_sample_rate,
-        dataset_root=data_args.dataset_root,
-        total_samples=data_args.total_text_samples,
-    )
-    warnings = audio_warnings + text_warnings
-
-    logger.info(
-        "音频样本准备完成: %d 条 (%s)",
-        len(audio_samples),
-        summarize_sample_sources(audio_samples) if audio_samples else "none",
-    )
-    logger.info(
-        "文本样本准备完成: %d 条 (%s)",
-        len(text_samples),
-        summarize_sample_sources(text_samples) if text_samples else "none",
-    )
-    if warnings:
-        logger.warning("样本准备告警: %s", warnings)
-
-    observation_sets: dict[str, dict[int, dict[str, Any]]] = {}
-    if audio_samples:
-        observation_sets["audio"] = collect_observations(model, audio_samples, obs_args, stage_name="audio")
-    if text_samples:
-        observation_sets["text"] = collect_observations(model, text_samples, obs_args, stage_name="text")
-    if not observation_sets:
-        raise RuntimeError("No available datasets were loaded. Please verify dataset paths or provide local JSONL data.")
-
-    logger.info("[阶段 4/8] 计算模态打分与保护专家")
-    layer_scores = score_experts(observation_sets, use_router_analysis_prior=cluster_args.use_router_analysis_prior)
-    layer_schedule = build_layer_adaptive_schedule(layer_scores, cluster_args)
-    if cluster_args.use_hybrid_strategy:
-        compression_plans = build_hybrid_compression_plan(layer_scores, layer_schedule, cluster_args)
-        protected_experts = {
-            layer_idx: plan.keep_experts
-            for layer_idx, plan in compression_plans.items()
-        }
+    warnings: list[str] = []
+    if observation_sets is None:
+        audio_samples, text_samples, warnings = prepare_modality_samples(processor, data_args)
+        observation_sets = collect_observation_sets(model, audio_samples, text_samples, obs_args)
     else:
-        protected_experts = select_protected_experts(
-            layer_scores,
-            protect_ratio=cluster_args.audio_protect_ratio,
-            protect_middle_layers=cluster_args.protect_middle_layers,
-            middle_layer_multiplier=cluster_args.middle_layer_multiplier,
-        )
-        compression_plans = {}
-        for layer_idx, score_dict in layer_scores.items():
-            num_experts = int(score_dict["audio_priority_score"].shape[0])
-            keep_experts = protected_experts.get(layer_idx, [])
-            target_experts = max(int(layer_schedule[layer_idx]["target_experts"]), len(keep_experts), 1)
-            merge_experts = [expert_idx for expert_idx in range(num_experts) if expert_idx not in set(keep_experts)]
-            merge_budget = max(target_experts - len(keep_experts), 0)
-            if len(merge_experts) > merge_budget:
-                merge_experts = merge_experts[:merge_budget]
-            pruned_experts = [
-                expert_idx for expert_idx in range(num_experts)
-                if expert_idx not in set(keep_experts) and expert_idx not in set(merge_experts)
-            ]
-            decision_labels = ["prune"] * num_experts
-            for expert_idx in merge_experts:
-                decision_labels[expert_idx] = "merge"
-            for expert_idx in keep_experts:
-                decision_labels[expert_idx] = "keep_audio"
-            compression_plans[layer_idx] = LayerCompressionPlan(
-                layer_idx=layer_idx,
-                num_experts=num_experts,
-                target_experts=target_experts,
-                target_compression_ratio=float(layer_schedule[layer_idx]["compression_ratio"]),
-                sensitivity_score=float(layer_schedule[layer_idx]["sensitivity_score"]),
-                normalized_sensitivity=float(layer_schedule[layer_idx]["normalized_sensitivity"]),
-                merge_cluster_count=min(len(merge_experts), merge_budget),
-                keep_experts=keep_experts,
-                audio_core_experts=keep_experts,
-                shared_experts=[],
-                merge_experts=merge_experts,
-                pruned_experts=pruned_experts,
-                decision_labels=decision_labels,
-                layer_stats={
-                    key: float(value) if isinstance(value, (int, float)) else float(value)
-                    for key, value in layer_schedule[layer_idx].items()
-                    if key != "target_experts"
-                },
-            )
-    save_scores(output_dir / "scores", layer_scores, protected_experts)
-    logger.info("打分完成，共 %d 层；保护专家已保存到 %s", len(layer_scores), output_dir / "scores")
+        logger.info("复用预先缓存的 observation_sets，跳过样本观测阶段")
+
+    layer_scores, layer_schedule, compression_plans, protected_experts = build_compression_plan(
+        output_dir=output_dir,
+        observation_sets=observation_sets,
+        cluster_args=cluster_args,
+    )
 
     clustering_observation = observation_sets.get("audio") or observation_sets.get("text")
+    if clustering_observation is None:
+        raise RuntimeError("No observation data available for clustering.")
     cluster_labels = build_cluster_labels(clustering_observation, cluster_args, compression_plans)
-    merge_model(model, cluster_labels, clustering_observation, merge_args, layer_scores)
-    compact_fused_experts(model, cluster_labels, clustering_observation)
+    merge_model(
+        model,
+        cluster_labels,
+        clustering_observation,
+        merge_args,
+        layer_scores,
+        validate_merge=validate_merge,
+    )
+    layer_num_experts = compact_fused_experts(model, cluster_labels, clustering_observation)
 
+    merged_model_dir: Path | None = None
     if reap_args.do_save:
-        logger.info("[阶段 8/8] 保存压缩模型与实验产物")
-        merged_model_dir = output_dir / "merged_model"
-        merged_model_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(merged_model_dir, safe_serialization=True)
-        tokenizer.save_pretrained(merged_model_dir)
-        logger.info("模型已保存到: %s", merged_model_dir)
+        merged_model_dir = save_merged_model(model, tokenizer, output_dir)
 
     save_run_artifacts(
         output_dir=output_dir,
@@ -444,6 +563,8 @@ def main():
         protected_experts=protected_experts,
         layer_schedule=layer_schedule,
         compression_plans=compression_plans,
+        save_observation_artifacts=save_observation_artifacts,
+        observation_artifact_reference=observation_artifact_reference,
     )
     logger.info("实验产物已写入: %s", output_dir)
 
@@ -451,6 +572,35 @@ def main():
         logger.info("执行保存后 smoke test")
         smoke_test(model, tokenizer)
         logger.info("smoke test 完成")
+
+    return CompressionRunResult(
+        output_dir=output_dir,
+        model=model,
+        processor=processor,
+        tokenizer=tokenizer,
+        warnings=warnings,
+        observation_sets=observation_sets,
+        layer_scores=layer_scores,
+        layer_schedule=layer_schedule,
+        compression_plans=compression_plans,
+        protected_experts=protected_experts,
+        cluster_labels=cluster_labels,
+        layer_num_experts=layer_num_experts,
+        merged_model_dir=merged_model_dir,
+    )
+
+
+def main():
+    reap_args, model_args, data_args, obs_args, cluster_args, merge_args, report_args = parse_args()
+    run_compression_pipeline(
+        reap_args=reap_args,
+        model_args=model_args,
+        data_args=data_args,
+        obs_args=obs_args,
+        cluster_args=cluster_args,
+        merge_args=merge_args,
+        report_args=report_args,
+    )
 
 
 if __name__ == "__main__":
